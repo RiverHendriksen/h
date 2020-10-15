@@ -3,7 +3,9 @@ from datetime import datetime
 
 from celery.utils.log import get_task_logger
 from dateutil.parser import isoparse
+from sqlalchemy import func, select, text
 
+from h.db.types import URLSafeUUID
 from h.models import Annotation, Job
 
 logger = get_task_logger(__name__)
@@ -23,30 +25,31 @@ class Queue:
         self._es = es
         self._batch_indexer = batch_indexer
 
-    def add(self, annotation_id, tag, schedule_in=None):
-        """Queue an annotation to be synced to Elasticsearch."""
-        self.add_all([annotation_id], tag, schedule_in)
+    def add_annotations_between_times(self, start_time, end_time, tag):
+        """
+        Add all annotations between two times to the search index.
 
-    def add_all(self, annotation_ids, tag, schedule_in=None):
-        """Queue a list of annotations to be synced to Elasticsearch."""
+        All annotations whose updated time is between the given start_time and
+        end_time (inclusive) will be queued for background indexing into
+        Elasticsearch.
 
-        scheduled_at = (datetime.utcnow() + schedule_in) if schedule_in else None
-
-        # Jobs with a lower number for their priority get processed before jobs
-        # with a higher number. Make large batches of jobs added all at once
-        # get processed *after* small batches added a few at a time, so that
-        # large batches don't hold up small ones for a long time.
-        priority = len(annotation_ids)
-
-        self._db.add_all(
-            Job(
-                tag=tag,
-                name="sync_annotation",
-                scheduled_at=scheduled_at,
-                priority=priority,
-                kwargs={"annotation_id": annotation_id},
+        :type start_time: datetime.datetime
+        :type end_time: datetime.datetime
+        """
+        self._db.execute(
+            Job.__table__.insert().from_select(
+                [Job.name, Job.priority, Job.tag, Job.kwargs],
+                select(
+                    [
+                        text("'sync_annotation'"),
+                        text("1000"),
+                        text(repr(tag)),
+                        func.jsonb_build_object("annotation_id", Annotation.id),
+                    ]
+                )
+                .where(Annotation.updated >= start_time)
+                .where(Annotation.updated <= end_time),
             )
-            for annotation_id in annotation_ids
         )
 
     def sync(self, limit):
@@ -70,6 +73,14 @@ class Queue:
 
         if not jobs:
             return
+
+        # Annotation IDs are stored in the DB's internal hex format in the job
+        # table but we need them in the URL-safe format used by
+        # models.Annotation and in Elasticsearch.
+        for job in jobs:
+            job.kwargs["annotation_id"] = URLSafeUUID().process_result_value(
+                job.kwargs["annotation_id"], "dialect"
+            )
 
         annotation_ids = {job.kwargs["annotation_id"] for job in jobs}
         annotations_from_db = self._get_annotations_from_db(annotation_ids)
